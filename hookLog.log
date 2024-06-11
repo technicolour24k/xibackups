@@ -1,0 +1,16 @@
+Connected to the pipe on the dll side!
+Received server hostname: '127.0.0.1'
+Attaching the dll. (Revision: $Rev: 34 $)
+Trying to replace the 'gethostbyname' function in polcore
+gethostbyname replaced!
+Trying to replace the 'gethostbyname' function in FFXIMAIN
+gethostbyname replaced!
+Searching for module offsets.
+CID: 00403080
+KEY: 00446274
+POLCORE CALL
+Redirecting ffxi00.pol.com to 127.0.0.1!
+FFXIMAIN CALL
+Redirecting 127.0.0.1 to 127.0.0.1!
+Detaching DLL
+Unhooked gethostbyname. Closing the log!
