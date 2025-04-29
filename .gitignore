@@ -2,3 +2,6 @@ TEMP/
 mov/
 USER/
 SYS/err*.bin
+SYS/info*.bin
+SYS/*.bin
+SYS/lb002.bin
