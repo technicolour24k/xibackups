@@ -169,25 +169,31 @@ function Get-RecordWeight {
 
 function Get-Chunks {
     param($Records, $TargetTree, [long]$ChunkBytes)
-    $chunks = New-Object System.Collections.Generic.List[Object]
-    $current = New-Object System.Collections.Generic.List[Object]
+    # Plain arrays with explicit comma-guards, not List[Object].Add(): PowerShell
+    # silently spreads an array's elements when it's passed to .Add() (or += on
+    # another array) instead of nesting it as one item - the comma forces it to
+    # be treated as a single element. Needed at every append AND at the final
+    # return, otherwise a result with exactly one chunk gets unwrapped back down
+    # to a plain list of records.
+    $chunks = @()
+    $current = @()
     $currentSize = 0L
     foreach ($rec in $Records) {
         $weight = Get-RecordWeight -Record $rec -TargetTree $TargetTree
         if ($current.Count -gt 0 -and ($currentSize + $weight) -gt $ChunkBytes) {
-            $chunks.Add($current.ToArray())
-            $current = New-Object System.Collections.Generic.List[Object]
+            $chunks += , $current
+            $current = @()
             $currentSize = 0L
         }
-        $current.Add($rec)
+        $current += $rec
         $currentSize += $weight
         if ($weight -gt $ChunkBytes) {
             $lastPath = $rec.Paths[$rec.Paths.Count - 1]
             Write-Warning ("  note: {0} alone is {1:N2} GiB, bigger than -ChunkGB; it gets its own chunk regardless." -f $lastPath, ($weight / 1GB))
         }
     }
-    if ($current.Count -gt 0) { $chunks.Add($current.ToArray()) }
-    return $chunks
+    if ($current.Count -gt 0) { $chunks += , $current }
+    return , $chunks
 }
 
 function Get-ChunkTotalBytes {
@@ -195,6 +201,26 @@ function Get-ChunkTotalBytes {
     $total = 0L
     foreach ($rec in $Chunk) { $total += (Get-RecordWeight -Record $rec -TargetTree $TargetTree) }
     return $total
+}
+
+function Get-WorkingTreeAsTree {
+    # Computes the tree that `git add -A` would produce, WITHOUT touching the
+    # real index: operates on a throwaway copy, so it's safe to call even
+    # during -DryRun. Caller must ensure the target branch is the one
+    # actually checked out (otherwise "the working tree" doesn't correspond
+    # to it).
+    param($Repo)
+    $realIndex = Join-Path $Repo ".git\index"
+    $scratchIndex = Join-Path $Repo ".git\git-split-push-worktree-index"
+    if (Test-Path $scratchIndex) { Remove-Item $scratchIndex -Force }
+    if (Test-Path $realIndex) { Copy-Item $realIndex $scratchIndex -Force }
+    try {
+        Invoke-Git -Repo $Repo -IndexPath $scratchIndex -NoCapture -GitArgs @('add', '-A') | Out-Null
+        return Invoke-Git -Repo $Repo -IndexPath $scratchIndex -GitArgs @('write-tree')
+    }
+    finally {
+        if (Test-Path $scratchIndex) { Remove-Item $scratchIndex -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 function Invoke-BuildAndPushChunk {
@@ -221,41 +247,99 @@ function Invoke-BuildAndPushChunk {
     $tree = Invoke-Git -Repo $Repo -IndexPath $IndexPath -GitArgs @('write-tree')
     $commit = Invoke-Git -Repo $Repo -GitArgs @('commit-tree', $tree, '-p', $Parent, '-m', $Message)
     Write-Host "  pushing $($commit.Substring(0,10)) ..."
-    Invoke-Git -Repo $Repo -NoCapture -GitArgs @('push', $Remote, "${commit}:refs/heads/${Branch}")
+    Invoke-Git -Repo $Repo -NoCapture -GitArgs @('push', $Remote, "${commit}:refs/heads/${Branch}") | Out-Null
     return [PSCustomObject]@{ Commit = $commit; Tree = $tree }
+}
+
+function Find-AutoBase {
+    param($Repo, $Remote, $Target)
+    $out = Invoke-Git -Repo $Repo -AllowFailure -GitArgs @('for-each-ref', "refs/remotes/$Remote", '--format=%(objectname) %(refname)')
+    if (-not $out) { return $null }
+
+    $best = $null
+    $bestName = $null
+    $bestDistance = -1
+    $seen = @{}
+    foreach ($line in ($out -split "`r?`n")) {
+        if (-not $line) { continue }
+        $parts = $line -split ' ', 2
+        $sha = $parts[0]
+        $refname = $parts[1]
+        if ($refname -like "*/HEAD") { continue }
+        if ($seen.ContainsKey($sha)) { continue }
+        $seen[$sha] = $true
+
+        Invoke-Git -Repo $Repo -AllowFailure -GitArgs @('merge-base', '--is-ancestor', $sha, $Target) | Out-Null
+        if ($LASTEXITCODE -ne 0) { continue }
+        $countStr = Invoke-Git -Repo $Repo -AllowFailure -GitArgs @('rev-list', '--count', "$sha..$Target")
+        if (-not $countStr) { continue }
+        $distance = [int]$countStr
+        if ($bestDistance -eq -1 -or $distance -lt $bestDistance) {
+            $best = $sha
+            $bestName = $refname
+            $bestDistance = $distance
+        }
+    }
+    if ($best) {
+        Write-Host "  using $bestName ($($best.Substring(0,10))) as base - $bestDistance commit(s) ahead of it."
+    }
+    return $best
 }
 
 try {
     if (-not $Branch) {
         $Branch = Invoke-Git -Repo $Repo -GitArgs @('symbolic-ref', '--short', 'HEAD')
     }
-    $Target = Invoke-Git -Repo $Repo -GitArgs @('rev-parse', $Branch)
+    $StartingTip = Invoke-Git -Repo $Repo -GitArgs @('rev-parse', $Branch)
 
     if (-not $NoFetch) {
         Write-Host "fetching ${Remote}/${Branch} ..."
-        Invoke-Git -Repo $Repo -NoCapture -AllowFailure -GitArgs @('fetch', $Remote, $Branch)
+        Invoke-Git -Repo $Repo -NoCapture -AllowFailure -GitArgs @('fetch', $Remote, $Branch) | Out-Null
     }
 
-    $BaseRef = if ($Base) { $Base } else { "${Remote}/${Branch}" }
-    $BaseSha = Invoke-Git -Repo $Repo -AllowFailure -GitArgs @('rev-parse', '--verify', $BaseRef)
-    if (-not $BaseSha) {
-        throw "couldn't resolve base '$BaseRef'. Pass -Base explicitly (e.g. the tip of the previous branch this one forked from)."
+    $BaseSha = $null
+    if ($Base) {
+        $BaseSha = Invoke-Git -Repo $Repo -AllowFailure -GitArgs @('rev-parse', '--verify', $Base)
+        if (-not $BaseSha) { throw "couldn't resolve -Base '$Base'." }
+    }
+    else {
+        $BaseRef = "${Remote}/${Branch}"
+        $BaseSha = Invoke-Git -Repo $Repo -AllowFailure -GitArgs @('rev-parse', '--verify', $BaseRef)
+        if (-not $BaseSha) {
+            # Brand new branch, never pushed - fall back to the nearest already-pushed
+            # ancestor commit (i.e. whichever remote branch this one forked from).
+            Write-Host "no '$BaseRef' yet (never pushed) - looking for the branch this forked from ..."
+            $BaseSha = Find-AutoBase -Repo $Repo -Remote $Remote -Target $StartingTip
+            if (-not $BaseSha) {
+                throw "couldn't resolve base 'origin/$Branch', and no ancestor of '$Branch' was found among any existing $Remote branch either. Pass -Base explicitly (e.g. the tip of the previous branch this one forked from)."
+            }
+        }
     }
 
-    if ($BaseSha -eq $Target) {
-        Write-Host "nothing to push - branch tip already matches base."
-        exit 0
+    # Fold in whatever's currently on disk for this branch (committed or not),
+    # instead of requiring a commit be made first. Computed via a throwaway
+    # copy of the index, so this never touches the real index or working
+    # tree - safe to do even under -DryRun. If a different branch is checked
+    # out, there's no "working tree state" for our target branch to fold in,
+    # so just fall back to its last real commit.
+    $CurrentHeadBranch = Invoke-Git -Repo $Repo -AllowFailure -GitArgs @('symbolic-ref', '--short', 'HEAD')
+    if ($CurrentHeadBranch -eq $Branch) {
+        $DiffTarget = Get-WorkingTreeAsTree -Repo $Repo
+    }
+    else {
+        Write-Warning "checked-out branch ('$CurrentHeadBranch') isn't the target branch ('$Branch') - any uncommitted changes are ignored; only pushing what's already committed on '$Branch'."
+        $DiffTarget = $StartingTip
     }
 
     $BaseTree = Invoke-Git -Repo $Repo -GitArgs @('rev-parse', "${BaseSha}^{tree}")
-    $TargetTreeSha = Invoke-Git -Repo $Repo -GitArgs @('rev-parse', "${Target}^{tree}")
+    $TargetTreeSha = Invoke-Git -Repo $Repo -GitArgs @('rev-parse', "${DiffTarget}^{tree}")
     if ($BaseTree -eq $TargetTreeSha) {
         Write-Host "nothing to push - tree content is identical to base (metadata-only diff)."
         exit 0
     }
 
-    $TargetTree = Get-TreeListing -Repo $Repo -Commit $Target
-    $Records = Get-DiffRecords -Repo $Repo -BaseSha $BaseSha -Target $Target
+    $TargetTree = Get-TreeListing -Repo $Repo -Commit $DiffTarget
+    $Records = Get-DiffRecords -Repo $Repo -BaseSha $BaseSha -Target $DiffTarget
     $ChunkBytes = [long]($ChunkGB * 1GB)
     $Chunks = Get-Chunks -Records $Records -TargetTree $TargetTree -ChunkBytes $ChunkBytes
 
@@ -300,12 +384,21 @@ try {
     }
 
     $CurrentBranchTip = Invoke-Git -Repo $Repo -GitArgs @('rev-parse', $Branch)
-    if ($CurrentBranchTip -ne $Target) {
-        Write-Warning "local branch '$Branch' moved during this run ($($Target.Substring(0,10)) -> $($CurrentBranchTip.Substring(0,10))). Not touching the ref; your new commits ($($FinalCommit.Substring(0,10))) are pushed and safe - reconcile manually."
+    if ($CurrentBranchTip -ne $StartingTip) {
+        Write-Warning "local branch '$Branch' moved during this run ($($StartingTip.Substring(0,10)) -> $($CurrentBranchTip.Substring(0,10))). Not touching the ref; your new commits ($($FinalCommit.Substring(0,10))) are pushed and safe - reconcile manually."
         exit 1
     }
 
     Invoke-Git -Repo $Repo -GitArgs @('update-ref', "refs/heads/$Branch", $FinalCommit) | Out-Null
+
+    if ($CurrentHeadBranch -eq $Branch) {
+        # Sync the real index to the new HEAD so `git status` reads clean -
+        # this only touches the index (never working-tree files), and is
+        # safe since we've just verified the new commit's tree matches
+        # exactly what's on disk.
+        Invoke-Git -Repo $Repo -GitArgs @('read-tree', $FinalCommit) | Out-Null
+    }
+
     Write-Host ""
     Write-Host "done. '$Branch' now points at $($FinalCommit.Substring(0,10)), tree verified identical to the original tip."
 }
